@@ -4870,6 +4870,244 @@ var _ = Describe("OpenStackOperator controller nova cell deletion", func() {
 	})
 })
 
+var _ = Describe("OpenStackOperator controller nova metadata TLS", func() {
+	BeforeEach(func() {
+		err := os.Setenv("OPERATOR_TEMPLATES", "../../templates")
+		Expect(err).NotTo(HaveOccurred())
+
+		DeferCleanup(k8sClient.Delete, ctx, CreateClusterConfigCM())
+
+		// there is no cert-manager running, create the root CA secrets so
+		// that the reconcile proceeds and creates the ca-bundle
+		DeferCleanup(k8sClient.Delete, ctx, CreateCertSecret(names.RootCAPublicName))
+		DeferCleanup(k8sClient.Delete, ctx, CreateCertSecret(names.RootCAInternalName))
+		DeferCleanup(k8sClient.Delete, ctx, CreateCertSecret(names.RootCAOvnName))
+		DeferCleanup(k8sClient.Delete, ctx, CreateCertSecret(names.RootCALibvirtName))
+
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.DBCertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.DBCell1CertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.RabbitMQCertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.RabbitMQCell1CertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.RabbitMQNotificationsCertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.OVNNorthdCertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.OVNControllerCertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.OVNMetricsCertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.InstanceHAMetricsCertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.NeutronOVNCertName))
+		DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(names.MemcachedCertName))
+
+		spec := GetDefaultOpenStackControlPlaneSpec()
+		spec["tls"] = GetTLSPublicSpec()
+		DeferCleanup(
+			th.DeleteInstance,
+			CreateOpenStackControlPlane(names.OpenStackControlplaneName, spec),
+		)
+
+		// enable pod level TLS, Nova and the services Nova depends on
+		Eventually(func(g Gomega) {
+			OSCtlplane := GetOpenStackControlPlane(names.OpenStackControlplaneName)
+			OSCtlplane.Spec.TLS.PodLevel.Enabled = true
+			OSCtlplane.Spec.Nova.Enabled = true
+			OSCtlplane.Spec.Nova.Template = &novav1.NovaSpecCore{}
+			OSCtlplane.Spec.Keystone.Enabled = true
+			OSCtlplane.Spec.Glance.Enabled = true
+			OSCtlplane.Spec.Neutron.Enabled = true
+			OSCtlplane.Spec.Placement.Enabled = true
+			if OSCtlplane.Spec.Placement.Template == nil {
+				OSCtlplane.Spec.Placement.Template = &placementv1.PlacementAPISpecCore{}
+				OSCtlplane.Spec.Placement.Template.APITimeout = 10
+			}
+			g.Expect(k8sClient.Update(ctx, OSCtlplane)).Should(Succeed())
+		}, timeout, interval).Should(Succeed())
+	})
+
+	When("the central nova-metadata k8s service exists", func() {
+		var metadataCertSecretName types.NamespacedName
+
+		BeforeEach(func() {
+			metadataCertSecretName = types.NamespacedName{
+				Name:      "cert-nova-metadata-internal-svc",
+				Namespace: namespace,
+			}
+			// simulate the nova-metadata service created by the nova-operator
+			th.CreateService(
+				types.NamespacedName{Name: "nova-metadata-internal", Namespace: namespace},
+				map[string]string{
+					"osctlplane-service": "nova-metadata",
+					"osctlplane":         "",
+					"type":               "central",
+				},
+				k8s_corev1.ServiceSpec{
+					Ports: []k8s_corev1.ServicePort{
+						{
+							Name:     "nova-metadata-internal",
+							Port:     int32(8775),
+							Protocol: k8s_corev1.ProtocolTCP,
+						},
+					},
+				})
+			DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(metadataCertSecretName))
+
+			Eventually(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.MetadataServiceTemplate.TLS.SecretName).To(
+					Equal(ptr.To(metadataCertSecretName.Name)))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("keeps the metadata TLS cert while the service does not match an updated label selector", func() {
+			// a label added to the service override becomes part of the
+			// selector used to find the service before the nova-operator
+			// applied it to the service
+			Eventually(func(g Gomega) {
+				OSCtlplane := GetOpenStackControlPlane(names.OpenStackControlplaneName)
+				OSCtlplane.Spec.Nova.Template.MetadataServiceTemplate.Override.Service = &service.OverrideSpec{
+					EmbeddedLabelsAnnotations: &service.EmbeddedLabelsAnnotations{
+						Labels: map[string]string{"foo": "bar"},
+					},
+				}
+				g.Expect(k8sClient.Update(ctx, OSCtlplane)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// the new label got propagated to the Nova CR ...
+			Eventually(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.MetadataServiceTemplate.Override.Service).ToNot(BeNil())
+				g.Expect(nova.Spec.MetadataServiceTemplate.Override.Service.Labels).To(
+					HaveKeyWithValue("foo", "bar"))
+			}, timeout, interval).Should(Succeed())
+
+			// ... without disabling TLS on the metadata service
+			Consistently(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.MetadataServiceTemplate.TLS.SecretName).To(
+					Equal(ptr.To(metadataCertSecretName.Name)))
+			}, 5*time.Second, interval).Should(Succeed())
+		})
+
+		It("keeps the metadata TLS cert while the service is missing", func() {
+			th.DeleteService(types.NamespacedName{Name: "nova-metadata-internal", Namespace: namespace})
+
+			// trigger a reconcile which patches the Nova CR
+			Eventually(func(g Gomega) {
+				OSCtlplane := GetOpenStackControlPlane(names.OpenStackControlplaneName)
+				OSCtlplane.Spec.Nova.Template.MetadataServiceTemplate.Replicas = ptr.To[int32](2)
+				g.Expect(k8sClient.Update(ctx, OSCtlplane)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.MetadataServiceTemplate.Replicas).To(Equal(ptr.To[int32](2)))
+			}, timeout, interval).Should(Succeed())
+
+			Consistently(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.MetadataServiceTemplate.TLS.SecretName).To(
+					Equal(ptr.To(metadataCertSecretName.Name)))
+			}, 5*time.Second, interval).Should(Succeed())
+		})
+	})
+
+	When("the cell1 nova-metadata k8s service exists", func() {
+		var metadataCertSecretName types.NamespacedName
+
+		BeforeEach(func() {
+			metadataCertSecretName = types.NamespacedName{
+				Name:      "cert-nova-metadata-cell1-internal-svc",
+				Namespace: namespace,
+			}
+			// move the metadata service from the top level to cell1
+			Eventually(func(g Gomega) {
+				OSCtlplane := GetOpenStackControlPlane(names.OpenStackControlplaneName)
+				OSCtlplane.Spec.Nova.Template.MetadataServiceTemplate.Enabled = ptr.To(false)
+				cell1 := OSCtlplane.Spec.Nova.Template.CellTemplates["cell1"]
+				cell1.MetadataServiceTemplate.Enabled = ptr.To(true)
+				OSCtlplane.Spec.Nova.Template.CellTemplates["cell1"] = cell1
+				g.Expect(k8sClient.Update(ctx, OSCtlplane)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// simulate the cell1 nova-metadata service created by the nova-operator
+			th.CreateService(
+				types.NamespacedName{Name: "nova-metadata-cell1-internal", Namespace: namespace},
+				map[string]string{
+					"osctlplane-service": "nova-metadata",
+					"osctlplane":         "",
+					"type":               "cell",
+					"cell":               "cell1",
+				},
+				k8s_corev1.ServiceSpec{
+					Ports: []k8s_corev1.ServicePort{
+						{
+							Name:     "nova-metadata-cell1-internal",
+							Port:     int32(8775),
+							Protocol: k8s_corev1.ProtocolTCP,
+						},
+					},
+				})
+			DeferCleanup(k8sClient.Delete, ctx, th.CreateCertSecret(metadataCertSecretName))
+
+			Eventually(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.CellTemplates).To(HaveKey("cell1"))
+				g.Expect(nova.Spec.CellTemplates["cell1"].MetadataServiceTemplate.TLS.SecretName).To(
+					Equal(ptr.To(metadataCertSecretName.Name)))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("keeps the metadata TLS cert while the service does not match an updated label selector", func() {
+			Eventually(func(g Gomega) {
+				OSCtlplane := GetOpenStackControlPlane(names.OpenStackControlplaneName)
+				cell1 := OSCtlplane.Spec.Nova.Template.CellTemplates["cell1"]
+				cell1.MetadataServiceTemplate.Override.Service = &service.OverrideSpec{
+					EmbeddedLabelsAnnotations: &service.EmbeddedLabelsAnnotations{
+						Labels: map[string]string{"foo": "bar"},
+					},
+				}
+				OSCtlplane.Spec.Nova.Template.CellTemplates["cell1"] = cell1
+				g.Expect(k8sClient.Update(ctx, OSCtlplane)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				override := nova.Spec.CellTemplates["cell1"].MetadataServiceTemplate.Override.Service
+				g.Expect(override).ToNot(BeNil())
+				g.Expect(override.Labels).To(HaveKeyWithValue("foo", "bar"))
+			}, timeout, interval).Should(Succeed())
+
+			Consistently(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.CellTemplates["cell1"].MetadataServiceTemplate.TLS.SecretName).To(
+					Equal(ptr.To(metadataCertSecretName.Name)))
+			}, 5*time.Second, interval).Should(Succeed())
+		})
+
+		It("keeps the metadata TLS cert while the service is missing", func() {
+			th.DeleteService(types.NamespacedName{Name: "nova-metadata-cell1-internal", Namespace: namespace})
+
+			// trigger a reconcile which patches the Nova CR
+			Eventually(func(g Gomega) {
+				OSCtlplane := GetOpenStackControlPlane(names.OpenStackControlplaneName)
+				cell1 := OSCtlplane.Spec.Nova.Template.CellTemplates["cell1"]
+				cell1.MetadataServiceTemplate.Replicas = ptr.To[int32](2)
+				OSCtlplane.Spec.Nova.Template.CellTemplates["cell1"] = cell1
+				g.Expect(k8sClient.Update(ctx, OSCtlplane)).Should(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.CellTemplates["cell1"].MetadataServiceTemplate.Replicas).To(
+					Equal(ptr.To[int32](2)))
+			}, timeout, interval).Should(Succeed())
+
+			Consistently(func(g Gomega) {
+				nova := GetNova(names.NovaName)
+				g.Expect(nova.Spec.CellTemplates["cell1"].MetadataServiceTemplate.TLS.SecretName).To(
+					Equal(ptr.To(metadataCertSecretName.Name)))
+			}, 5*time.Second, interval).Should(Succeed())
+		})
+	})
+})
+
 var _ = Describe("Application Credentials configuration in control plane", func() {
 	When("global application credentials are enabled", func() {
 		BeforeEach(func() {
