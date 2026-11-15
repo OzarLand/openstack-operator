@@ -275,11 +275,14 @@ func ReconcileNova(ctx context.Context, instance *corev1beta1.OpenStackControlPl
 	// create certificate for central Metadata agent if internal TLS and Metadata are enabled
 	if instance.Spec.TLS.PodLevel.Enabled &&
 		metadataEnabled(instance.Spec.Nova.Template.MetadataServiceTemplate) {
+		// select the service by the operator owned labels only. The user
+		// labels of the service override are not on the service until the
+		// nova-operator applied them.
 		certScrt, ctrlResult, err := certmanager.EnsureCertForServiceWithSelector(
 			ctx,
 			helper,
 			nova.Namespace,
-			instance.Spec.Nova.Template.MetadataServiceTemplate.Override.Service.Labels,
+			centralMetadataLabelMap(nova.Name),
 			instance.GetInternalIssuer(),
 			nil)
 		if err != nil && !k8s_errors.IsNotFound(err) {
@@ -288,8 +291,15 @@ func ReconcileNova(ctx context.Context, instance *corev1beta1.OpenStackControlPl
 			return ctrlResult, nil
 		}
 
-		// update NovaMetadata cert secret
-		instance.Spec.Nova.Template.MetadataServiceTemplate.TLS.SecretName = ptr.To(certScrt)
+		// update NovaMetadata cert secret. certScrt is empty on NotFound, e.g.
+		// the metadata service does not exist yet on initial deployment, or
+		// the cert secret is missing. Keep the cert secret restored from the
+		// Nova CR in that case to not disable TLS on a running metadata service.
+		if certScrt != "" {
+			instance.Spec.Nova.Template.MetadataServiceTemplate.TLS.SecretName = ptr.To(certScrt)
+		} else {
+			Log.Info("NovaMetadata cert not available, keeping the current TLS config", "error", err)
+		}
 	}
 
 	// cell Metadata and NoVNCProxy
@@ -302,7 +312,7 @@ func ReconcileNova(ctx context.Context, instance *corev1beta1.OpenStackControlPl
 				ctx,
 				helper,
 				nova.Namespace,
-				cellTemplate.MetadataServiceTemplate.Override.Service.Labels,
+				cellMetadataLabelMap(nova.Name, cellName),
 				instance.GetInternalIssuer(),
 				nil)
 			if err != nil && !k8s_errors.IsNotFound(err) {
@@ -310,8 +320,13 @@ func ReconcileNova(ctx context.Context, instance *corev1beta1.OpenStackControlPl
 			} else if (ctrlResult != ctrl.Result{}) {
 				return ctrlResult, nil
 			}
-			// update NovaMetadata cert secret
-			cellTemplate.MetadataServiceTemplate.TLS.SecretName = ptr.To(certScrt)
+			// update NovaMetadata cert secret, keep the restored one on
+			// NotFound (see above)
+			if certScrt != "" {
+				cellTemplate.MetadataServiceTemplate.TLS.SecretName = ptr.To(certScrt)
+			} else {
+				Log.Info("NovaMetadata cert not available, keeping the current TLS config", "cell", cellName, "error", err)
+			}
 		}
 
 		// NoVNCProxy check for/creating route if service is enabled
